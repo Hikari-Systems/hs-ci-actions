@@ -23,6 +23,24 @@ inputs:
   platforms:
     description: Platforms that must be present, space separated.
     default: amd64 arm64
+  save-to-s3-registry:
+    description: >
+      Also copy the finished multi-arch image, under the same tags, into the S3-backed registry
+      (registry:3.0 on s3-bucket). Independent of the build's cache profile. Set to false to skip.
+    default: 'true'
+  s3-repository:
+    description: Repository name inside the S3-backed registry. Defaults to the last part of image.
+    default: ''
+  s3-bucket:
+    default: ''
+  s3-region:
+    default: ''
+  aws-access-key-id:
+    default: ''
+  aws-secret-access-key:
+    default: ''
+  registry-http-secret:
+    default: ''
 
 outputs:
   digest:
@@ -68,6 +86,49 @@ runs:
         ARGS=()
         while IFS= read -r t; do t="${t// /}"; [ -n "$t" ] && ARGS+=(-t "$IMAGE:$t"); done <<< "$TAGS"
         docker buildx imagetools create "${ARGS[@]}" "${SRCS[@]}"
+        { printf 'tags<<EOF\n%s\nEOF\n' "$TAGS"; } >> "$GITHUB_OUTPUT"
         FIRST="${ARGS[1]}"
         docker buildx imagetools inspect "$FIRST"
         echo "digest=$(docker buildx imagetools inspect "$FIRST" --format '{{json .Manifest}}' | jq -r .digest)" >> "$GITHUB_OUTPUT"
+
+    - name: Start the S3-backed registry
+      id: reg
+      if: inputs.save-to-s3-registry == 'true'
+      shell: bash
+      env:
+        REGISTRY_STORAGE_S3_BUCKET: ${{ inputs.s3-bucket }}
+        REGISTRY_STORAGE_S3_REGION: ${{ inputs.s3-region }}
+        REGISTRY_STORAGE_S3_ACCESSKEY: ${{ inputs.aws-access-key-id }}
+        REGISTRY_STORAGE_S3_SECRETKEY: ${{ inputs.aws-secret-access-key }}
+        REGISTRY_HTTP_SECRET: ${{ inputs.registry-http-secret }}
+      run: '"$GITHUB_ACTION_PATH/../scripts/start-s3-registry.sh" merge'
+
+    - name: Copy the image into the S3-backed registry
+      if: inputs.save-to-s3-registry == 'true'
+      shell: bash
+      env:
+        IMAGE: ${{ inputs.image }}
+        TAGS: ${{ steps.merge.outputs.tags }}
+        REPO_IN: ${{ inputs.s3-repository }}
+        PORT: ${{ steps.reg.outputs.port }}
+        SRC_REGISTRY: ${{ inputs.registry }}
+        SRC_USER: ${{ inputs.registry-username }}
+        SRC_TOKEN: ${{ inputs.registry-token }}
+      run: |
+        command -v skopeo >/dev/null || { sudo apt-get update -qq && sudo apt-get install -y -qq skopeo; }
+        # Its own auth file: skopeo's default lives under /run/containers, which a runner service may not create.
+        export REGISTRY_AUTH_FILE="$RUNNER_TEMP/skopeo-auth-$GITHUB_JOB.json"
+        printf '%s' "$SRC_TOKEN" | skopeo login "$SRC_REGISTRY" --username "$SRC_USER" --password-stdin
+        REPO="${REPO_IN:-${IMAGE##*/}}"
+        while IFS= read -r t; do
+          t="${t// /}"; [ -n "$t" ] || continue
+          skopeo copy --all --retry-times 3 --dest-tls-verify=false \
+            "docker://$IMAGE:$t" "docker://127.0.0.1:$PORT/$REPO:$t"
+          echo "Saved $REPO:$t to the S3-backed registry"
+        done <<< "$TAGS"
+        rm -f "$REGISTRY_AUTH_FILE"
+
+    - name: Stop the S3-backed registry
+      if: always() && steps.reg.outputs.name != ''
+      shell: bash
+      run: docker rm -f "${{ steps.reg.outputs.name }}" >/dev/null 2>&1 || true

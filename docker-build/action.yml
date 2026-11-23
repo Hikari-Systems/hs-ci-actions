@@ -104,38 +104,20 @@ runs:
         username: ${{ inputs.registry-username }}
         password: ${{ inputs.registry-token }}
 
-    # s3reg: a plain-HTTP registry on a random loopback port, storing in S3. Several runners can
-    # share a host, so neither the container name nor the port is fixed.
     - name: Start the S3 cache registry
       id: reg
       if: steps.profile.outputs.cache == 's3reg'
       shell: bash
       env:
-        REGISTRY_STORAGE: s3
         REGISTRY_STORAGE_S3_BUCKET: ${{ inputs.s3-bucket }}
         REGISTRY_STORAGE_S3_REGION: ${{ inputs.s3-region }}
         REGISTRY_STORAGE_S3_ACCESSKEY: ${{ inputs.aws-access-key-id }}
         REGISTRY_STORAGE_S3_SECRETKEY: ${{ inputs.aws-secret-access-key }}
         REGISTRY_HTTP_SECRET: ${{ inputs.registry-http-secret }}
       run: |
-        NAME="hs-cache-reg-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${{ inputs.platform }}-$RANDOM"
-        docker run -d --name "$NAME" -p 127.0.0.1::5000 \
-          -e REGISTRY_STORAGE -e REGISTRY_STORAGE_S3_BUCKET -e REGISTRY_STORAGE_S3_REGION \
-          -e REGISTRY_STORAGE_S3_ACCESSKEY -e REGISTRY_STORAGE_S3_SECRETKEY -e REGISTRY_HTTP_SECRET \
-          -e REGISTRY_HTTP_ADDR=:5000 registry:3.0 >/dev/null
-        PORT=$(docker port "$NAME" 5000/tcp | head -1 | sed 's/.*://')
-        for i in $(seq 1 30); do curl -fs "http://127.0.0.1:$PORT/v2/" >/dev/null && break; sleep 1; done
-        curl -fs "http://127.0.0.1:$PORT/v2/" >/dev/null || { docker logs "$NAME" | tail -20; echo "::error::cache registry did not start"; exit 1; }
-        CONFIG="$RUNNER_TEMP/buildkitd-$NAME.toml"
-        printf '[registry."127.0.0.1:%s"]\n  http = true\n  insecure = true\n' "$PORT" > "$CONFIG"
-        # HUB_MIRROR may be set in a self-hosted runner's environment to a Docker Hub proxy.
-        if [ -n "${HUB_MIRROR:-}" ]; then
-          MIRROR="${HUB_MIRROR#http://}"
-          printf '[registry."docker.io"]\n  mirrors = ["%s"]\n[registry."%s"]\n  http = true\n  insecure = true\n' "$MIRROR" "$MIRROR" >> "$CONFIG"
-        fi
-        echo "name=$NAME" >> "$GITHUB_OUTPUT"
+        "$GITHUB_ACTION_PATH/../scripts/start-s3-registry.sh" "${{ inputs.platform }}"
+        PORT=$(grep '^port=' "$GITHUB_OUTPUT" | tail -1 | cut -d= -f2)
         echo "ref=127.0.0.1:$PORT/${{ steps.profile.outputs.scope }}:buildcache" >> "$GITHUB_OUTPUT"
-        echo "config=$CONFIG" >> "$GITHUB_OUTPUT"
 
     - name: Set up buildx (host network, for the local cache registry)
       if: steps.profile.outputs.cache == 's3reg'

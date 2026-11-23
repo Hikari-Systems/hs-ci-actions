@@ -43,3 +43,4 @@ jobs:
           image: ghcr.io/${{ github.repository }}-selftest
           tags: ${{ github.sha }}
           registry-token: ${{ secrets.GITHUB_TOKEN }}
+          save-to-s3-registry: false

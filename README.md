@@ -47,7 +47,16 @@ the registry; the platform images are children of the index, as with a single-st
     image: ghcr.io/owner/name
     registry-token: ${{ secrets.GITHUB_TOKEN }}
     # tags: one per line; default is the commit SHA, the branch name (/ → -) and latest
+    # save-to-s3-registry defaults to true: the finished image is also copied, under the same
+    # tags, into a registry:3.0 backed by s3-bucket, whatever cache the build used.
+    s3-bucket: my-registry-bucket
+    s3-region: ${{ secrets.AWS_REGION }}
+    aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+    aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
 ```
+
+With `save-to-s3-registry: true` (the default) the step fails if the bucket or credentials are
+missing, so a missing copy never goes unnoticed. Pass `save-to-s3-registry: false` to skip it.
 
 ## Versioning
 
