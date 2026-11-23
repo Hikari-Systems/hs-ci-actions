@@ -1,0 +1,45 @@
+name: Self-test
+
+on:
+  workflow_dispatch:
+    inputs:
+      cache:
+        description: Cache profile to test (auto, s3reg, blacksmith, gha, none)
+        default: auto
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    runs-on: ${{ fromJSON(vars.RUNNER_MAP || '{}')[matrix.runner] || (contains(matrix.runner, 'arm64') && 'ubuntu-24.04-arm' || 'ubuntu-latest') }}
+    timeout-minutes: 15
+    strategy:
+      matrix:
+        platform: [amd64, arm64]
+        include:
+          - platform: amd64
+            runner: linux-x64-build
+          - platform: arm64
+            runner: linux-arm64-build
+    steps:
+      - uses: actions/checkout@v6.0.2
+      - uses: ./docker-build
+        with:
+          image: ghcr.io/${{ github.repository }}-selftest
+          platform: ${{ matrix.platform }}
+          cache: ${{ inputs.cache }}
+          context: test
+          registry-token: ${{ secrets.GITHUB_TOKEN }}
+
+  merge:
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - uses: actions/checkout@v6.0.2
+      - uses: ./merge-manifest
+        with:
+          image: ghcr.io/${{ github.repository }}-selftest
+          tags: ${{ github.sha }}
+          registry-token: ${{ secrets.GITHUB_TOKEN }}

@@ -1,0 +1,227 @@
+name: docker-build
+description: >
+  Build one platform of a container image, push it to a registry by digest (no tag), and
+  hand the digest to merge-manifest through a short-lived artifact. The layer cache follows
+  the runner: a local S3-backed registry on self-hosted runners, the Blacksmith sticky-disk
+  builder on Blacksmith, and the GitHub Actions cache on GitHub-hosted runners.
+
+inputs:
+  image:
+    description: Image name without a tag, e.g. ghcr.io/owner/name. Must be lowercase.
+    required: true
+  platform:
+    description: Target architecture, amd64 or arm64.
+    required: true
+  cache:
+    description: >
+      Cache profile: auto, s3reg, blacksmith, gha or none. auto picks blacksmith on Blacksmith
+      runners, gha on GitHub-hosted runners and s3reg on other self-hosted runners. A requested
+      blacksmith profile on a non-Blacksmith runner falls back to auto.
+    default: auto
+  cache-scope:
+    description: Name the cache is kept under. Defaults to the repository name.
+    default: ''
+  context:
+    default: .
+  file:
+    description: Dockerfile path. Empty means <context>/Dockerfile.
+    default: ''
+  build-args:
+    default: ''
+  secret-envs:
+    description: Passed to build-push-action secret-envs (id=ENV_VAR lines). Set the env vars on the calling step.
+    default: ''
+  ssh:
+    description: Passed to build-push-action ssh.
+    default: ''
+  registry:
+    description: Registry host to log in to.
+    default: ghcr.io
+  registry-username:
+    default: ${{ github.actor }}
+  registry-token:
+    description: Token with permission to push to the image.
+    required: true
+  artifact-prefix:
+    description: Digest artifact prefix. Change it when one workflow builds more than one image.
+    default: digest
+  s3-bucket:
+    description: Bucket for the s3reg cache profile.
+    default: ''
+  s3-region:
+    default: ''
+  aws-access-key-id:
+    default: ''
+  aws-secret-access-key:
+    default: ''
+  registry-http-secret:
+    description: REGISTRY_HTTP_SECRET for the local cache registry (s3reg).
+    default: ''
+
+outputs:
+  digest:
+    description: Digest of the pushed platform image.
+    value: ${{ steps.bx.outputs.digest || steps.bs.outputs.digest }}
+  cache:
+    description: The cache profile that was used.
+    value: ${{ steps.profile.outputs.cache }}
+
+runs:
+  using: composite
+  steps:
+    - name: Choose the cache profile
+      id: profile
+      shell: bash
+      env:
+        WANT: ${{ inputs.cache }}
+        BUCKET: ${{ inputs.s3-bucket }}
+        AWS_ID: ${{ inputs.aws-access-key-id }}
+        SCOPE_IN: ${{ inputs.cache-scope }}
+        PLATFORM: ${{ inputs.platform }}
+      run: |
+        case "$PLATFORM" in amd64|arm64) ;; *) echo "::error::platform must be amd64 or arm64, got '$PLATFORM'"; exit 1;; esac
+        if [[ "${RUNNER_NAME:-}" == blacksmith* ]]; then HERE=blacksmith
+        elif [ "${RUNNER_ENVIRONMENT:-}" = github-hosted ]; then HERE=gha
+        else HERE=s3reg; fi
+        CACHE="${WANT:-auto}"
+        [ "$CACHE" = auto ] && CACHE=$HERE
+        if [ "$CACHE" = blacksmith ] && [ "$HERE" != blacksmith ]; then
+          echo "::warning::cache=blacksmith requested on a non-Blacksmith runner; using $HERE"; CACHE=$HERE
+        fi
+        if [ "$CACHE" = s3reg ] && { [ -z "$BUCKET" ] || [ -z "$AWS_ID" ]; }; then
+          echo "::warning::cache=s3reg needs s3-bucket and AWS credentials; building without a cache"; CACHE=none
+        fi
+        case "$CACHE" in s3reg|blacksmith|gha|none) ;; *) echo "::error::unknown cache profile '$CACHE'"; exit 1;; esac
+        SCOPE="${SCOPE_IN:-${GITHUB_REPOSITORY#*/}}"
+        echo "cache=$CACHE" >> "$GITHUB_OUTPUT"
+        echo "scope=$SCOPE-$PLATFORM" >> "$GITHUB_OUTPUT"
+        echo "Runner kind: $HERE, cache profile: $CACHE, scope: $SCOPE-$PLATFORM"
+
+    - name: Log in to the registry
+      uses: docker/login-action@v4.7.0
+      with:
+        registry: ${{ inputs.registry }}
+        username: ${{ inputs.registry-username }}
+        password: ${{ inputs.registry-token }}
+
+    # s3reg: a plain-HTTP registry on a random loopback port, storing in S3. Several runners can
+    # share a host, so neither the container name nor the port is fixed.
+    - name: Start the S3 cache registry
+      id: reg
+      if: steps.profile.outputs.cache == 's3reg'
+      shell: bash
+      env:
+        REGISTRY_STORAGE: s3
+        REGISTRY_STORAGE_S3_BUCKET: ${{ inputs.s3-bucket }}
+        REGISTRY_STORAGE_S3_REGION: ${{ inputs.s3-region }}
+        REGISTRY_STORAGE_S3_ACCESSKEY: ${{ inputs.aws-access-key-id }}
+        REGISTRY_STORAGE_S3_SECRETKEY: ${{ inputs.aws-secret-access-key }}
+        REGISTRY_HTTP_SECRET: ${{ inputs.registry-http-secret }}
+      run: |
+        NAME="hs-cache-reg-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${{ inputs.platform }}-$RANDOM"
+        docker run -d --name "$NAME" -p 127.0.0.1::5000 \
+          -e REGISTRY_STORAGE -e REGISTRY_STORAGE_S3_BUCKET -e REGISTRY_STORAGE_S3_REGION \
+          -e REGISTRY_STORAGE_S3_ACCESSKEY -e REGISTRY_STORAGE_S3_SECRETKEY -e REGISTRY_HTTP_SECRET \
+          -e REGISTRY_HTTP_ADDR=:5000 registry:3.0 >/dev/null
+        PORT=$(docker port "$NAME" 5000/tcp | head -1 | sed 's/.*://')
+        for i in $(seq 1 30); do curl -fs "http://127.0.0.1:$PORT/v2/" >/dev/null && break; sleep 1; done
+        curl -fs "http://127.0.0.1:$PORT/v2/" >/dev/null || { docker logs "$NAME" | tail -20; echo "::error::cache registry did not start"; exit 1; }
+        CONFIG="$RUNNER_TEMP/buildkitd-$NAME.toml"
+        printf '[registry."127.0.0.1:%s"]\n  http = true\n  insecure = true\n' "$PORT" > "$CONFIG"
+        # HUB_MIRROR may be set in a self-hosted runner's environment to a Docker Hub proxy.
+        if [ -n "${HUB_MIRROR:-}" ]; then
+          MIRROR="${HUB_MIRROR#http://}"
+          printf '[registry."docker.io"]\n  mirrors = ["%s"]\n[registry."%s"]\n  http = true\n  insecure = true\n' "$MIRROR" "$MIRROR" >> "$CONFIG"
+        fi
+        echo "name=$NAME" >> "$GITHUB_OUTPUT"
+        echo "ref=127.0.0.1:$PORT/${{ steps.profile.outputs.scope }}:buildcache" >> "$GITHUB_OUTPUT"
+        echo "config=$CONFIG" >> "$GITHUB_OUTPUT"
+
+    - name: Set up buildx (host network, for the local cache registry)
+      if: steps.profile.outputs.cache == 's3reg'
+      uses: docker/setup-buildx-action@v4.4.1
+      with:
+        driver-opts: network=host
+        buildkitd-config: ${{ steps.reg.outputs.config }}
+
+    - name: Set up buildx
+      if: steps.profile.outputs.cache == 'gha' || steps.profile.outputs.cache == 'none'
+      uses: docker/setup-buildx-action@v4.4.1
+
+    - name: Set up the Blacksmith builder
+      if: steps.profile.outputs.cache == 'blacksmith'
+      uses: useblacksmith/setup-docker-builder@v2.3.0
+      with:
+        cache-key: ${{ steps.profile.outputs.scope }}
+
+    - name: Work out cache flags
+      id: flags
+      shell: bash
+      env:
+        CACHE: ${{ steps.profile.outputs.cache }}
+        REF: ${{ steps.reg.outputs.ref }}
+        SCOPE: ${{ steps.profile.outputs.scope }}
+      run: |
+        case "$CACHE" in
+          s3reg) FROM="type=registry,ref=$REF"; TO="type=registry,ref=$REF,mode=max,image-manifest=true,oci-mediatypes=true" ;;
+          gha)   FROM="type=gha,scope=$SCOPE";  TO="type=gha,scope=$SCOPE,mode=max" ;;
+          *)     FROM=""; TO="" ;;
+        esac
+        echo "from=$FROM" >> "$GITHUB_OUTPUT"
+        echo "to=$TO" >> "$GITHUB_OUTPUT"
+
+    # No provenance or SBOM: they would add attestation manifests under every image index.
+    - name: Build and push by digest
+      id: bx
+      if: steps.profile.outputs.cache != 'blacksmith'
+      uses: docker/build-push-action@v7.4.0
+      with:
+        context: ${{ inputs.context }}
+        file: ${{ inputs.file }}
+        platforms: linux/${{ inputs.platform }}
+        build-args: ${{ inputs.build-args }}
+        secret-envs: ${{ inputs.secret-envs }}
+        ssh: ${{ inputs.ssh }}
+        cache-from: ${{ steps.flags.outputs.from }}
+        cache-to: ${{ steps.flags.outputs.to }}
+        provenance: false
+        sbom: false
+        outputs: type=image,name=${{ inputs.image }},push-by-digest=true,name-canonical=true,push=true
+
+    - name: Build and push by digest (Blacksmith)
+      id: bs
+      if: steps.profile.outputs.cache == 'blacksmith'
+      uses: useblacksmith/build-push-action@v2.3.0
+      with:
+        context: ${{ inputs.context }}
+        file: ${{ inputs.file }}
+        platforms: linux/${{ inputs.platform }}
+        build-args: ${{ inputs.build-args }}
+        secret-envs: ${{ inputs.secret-envs }}
+        ssh: ${{ inputs.ssh }}
+        provenance: false
+        sbom: false
+        outputs: type=image,name=${{ inputs.image }},push-by-digest=true,name-canonical=true,push=true
+
+    - name: Write the digest
+      shell: bash
+      env:
+        DIGEST: ${{ steps.bx.outputs.digest || steps.bs.outputs.digest }}
+      run: |
+        [[ "$DIGEST" == sha256:* ]] || { echo "::error::no digest from the build"; exit 1; }
+        mkdir -p "$RUNNER_TEMP/hs-digests"
+        printf '%s\n' "$DIGEST" > "$RUNNER_TEMP/hs-digests/${{ inputs.platform }}"
+        echo "Pushed ${{ inputs.image }}@$DIGEST"
+
+    - name: Upload the digest
+      uses: actions/upload-artifact@v7.0.2
+      with:
+        name: ${{ inputs.artifact-prefix }}-${{ inputs.platform }}
+        path: ${{ runner.temp }}/hs-digests/${{ inputs.platform }}
+        retention-days: 1
+        if-no-files-found: error
+
+    - name: Stop the S3 cache registry
+      if: always() && steps.reg.outputs.name != ''
+      shell: bash
+      run: docker rm -f "${{ steps.reg.outputs.name }}" >/dev/null 2>&1 || true
